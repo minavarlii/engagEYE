@@ -1,11 +1,11 @@
 """
 engagEYE - Student Engagement Analysis Backend
 Stack: OpenCV (video I/O + preprocessing) + MediaPipe (facial landmarks)
-Flask API: POST /analyze  →  JSON with events, segments, score, AI summary, frame thumbnails
+Flask API: POST /analyze -> JSON with events, segments, score, AI summary, frame thumbnails
 
 Detectors:
   Negative: yawn, eyes_closed, look_away, inactivity
-  Positive: smile, nodding
+  Positive: smile
 """
 
 import cv2
@@ -28,9 +28,6 @@ R_EAR_IDX = [33,  160, 158, 133, 153, 144]
 MOUTH_IDX = [61, 291, 39, 181, 0, 17, 269, 405]
 POSE_IDX  = [1, 33, 263, 61, 291, 199]
 
-# Smile landmarks - corners and top/bottom lip
-SMILE_IDX = [61, 291, 39, 269, 0, 17]
-
 FACE_3D = np.array([
     [0.0,    0.0,    0.0   ],
     [-225.0, -170.0, -135.0],
@@ -49,13 +46,10 @@ INACTIVITY_GAP_S    = 5
 EYE_CONSEC_FRAMES   = 6
 YAWN_CONSEC_FRAMES  = 4
 LOOK_AWAY_DEDUP_S   = 3
-SMILE_THRESH        = 0.35   # smile ratio threshold
-SMILE_CONSEC_FRAMES = 4      # ~1s of smiling
-NOD_PITCH_DELTA     = 8.0    # degrees of pitch movement = nod
-NOD_CONSEC_FRAMES   = 3      # quick up-down movement
-NOD_DEDUP_S         = 3      # min seconds between nod events
+SMILE_THRESH        = 0.35
+SMILE_CONSEC_FRAMES = 4
 
-# Penalties (negative) and bonuses (positive)
+# Penalties and bonuses
 PENALTY = {
     "yawn":        12,
     "eyes_closed":  8,
@@ -63,8 +57,7 @@ PENALTY = {
     "inactivity":  15,
 }
 BONUS = {
-    "smile":        5,
-    "nodding":      8,
+    "smile": 5,
 }
 
 THUMBNAIL_W = 160
@@ -73,12 +66,14 @@ THUMBNAIL_W = 160
 def dist(p1, p2):
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
+
 def calc_ear(landmarks, idx, w, h):
     pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in idx]
     A = dist(pts[1], pts[5])
     B = dist(pts[2], pts[4])
     C = dist(pts[0], pts[3])
     return (A + B) / (2.0 * C + 1e-6)
+
 
 def calc_mar(landmarks, w, h):
     pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in MOUTH_IDX]
@@ -87,34 +82,26 @@ def calc_mar(landmarks, w, h):
     hz = dist(pts[0], pts[1])
     return (v1 + v2) / (2.0 * hz + 1e-6)
 
+
 def calc_smile_ratio(landmarks, w, h):
     """
-    Smile ratio = mouth width / face width
-    When smiling, mouth corners pull outward increasing this ratio.
-    Also checks that mouth is NOT open wide (to avoid confusing with yawn).
+    Smile ratio = mouth width / face width.
+    Returns 0 if mouth is too open (yawning).
     """
     left_corner  = (landmarks[61].x * w,  landmarks[61].y * h)
     right_corner = (landmarks[291].x * w, landmarks[291].y * h)
     mouth_width  = dist(left_corner, right_corner)
 
-    # Face width from ear to ear (approx using cheek landmarks)
     left_cheek  = (landmarks[234].x * w, landmarks[234].y * h)
     right_cheek = (landmarks[454].x * w, landmarks[454].y * h)
     face_width  = dist(left_cheek, right_cheek) + 1e-6
 
-    smile_ratio = mouth_width / face_width
-
-    # Also check lip curl — upper lip center should be raised
-    upper_lip = landmarks[13].y * h
-    lower_lip = landmarks[14].y * h
-    mouth_open = lower_lip - upper_lip
-
-    # Smile: wide mouth, not open vertically (not yawning)
     mar = calc_mar(landmarks, w, h)
-    if mar > MAR_THRESH * 0.8:   # mouth too open = not a smile
+    if mar > MAR_THRESH * 0.8:
         return 0.0
 
-    return smile_ratio
+    return mouth_width / face_width
+
 
 def calc_head_pose(landmarks, w, h):
     pts2d = np.array(
@@ -135,9 +122,11 @@ def calc_head_pose(landmarks, w, h):
     angles, *_ = cv2.RQDecomp3x3(rmat)
     return angles[1] * 360, angles[0] * 360
 
+
 def fmt_ts(seconds):
     td = str(timedelta(seconds=int(seconds)))
     return td[2:] if len(td) <= 7 else td
+
 
 def ts_to_s(ts):
     parts = list(map(int, ts.split(":")))
@@ -145,10 +134,12 @@ def ts_to_s(ts):
         return parts[0] * 60 + parts[1]
     return parts[0] * 3600 + parts[1] * 60 + parts[2]
 
+
 def engagement_label(score):
     if score >= 65: return "HIGH"
     if score >= 40: return "MEDIUM"
     return "LOW"
+
 
 def frame_to_base64(frame):
     h, w = frame.shape[:2]
@@ -171,18 +162,13 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
 
     events, segments = [], []
 
-    eye_consec      = 0
-    yawn_consec     = 0
-    smile_consec    = 0
-    last_face_frm   = 0
-    last_inact_frm  = -(INACTIVITY_GAP_S * fps + 1)
-    seg_start       = 0.0
-    seg_score       = 100
-
-    # Nod detection state
-    prev_pitch      = None
-    pitch_history   = []
-    last_nod_t      = -NOD_DEDUP_S - 1
+    eye_consec     = 0
+    yawn_consec    = 0
+    smile_consec   = 0
+    last_face_frm  = 0
+    last_inact_frm = -(INACTIVITY_GAP_S * fps + 1)
+    seg_start      = 0.0
+    seg_score      = 100
 
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
@@ -251,7 +237,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         last_face_frm = frame_idx
         lm = result.multi_face_landmarks[0].landmark
 
-        # ── EAR eye closure ───────────────────────────────────────────────
+        # EAR - eye closure
         avg_ear = (calc_ear(lm, L_EAR_IDX, w, h) + calc_ear(lm, R_EAR_IDX, w, h)) / 2.0
         if avg_ear < EAR_THRESH:
             eye_consec += 1
@@ -266,7 +252,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             eye_consec = 0
 
-        # ── MAR yawn ──────────────────────────────────────────────────────
+        # MAR - yawn
         m_ratio = calc_mar(lm, w, h)
         if m_ratio > MAR_THRESH:
             yawn_consec += 1
@@ -281,12 +267,11 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             yawn_consec = 0
 
-        # ── Smile detection ───────────────────────────────────────────────
+        # Smile detection
         smile_ratio = calc_smile_ratio(lm, w, h)
         if smile_ratio > SMILE_THRESH:
             smile_consec += 1
             if smile_consec == SMILE_CONSEC_FRAMES:
-                # Deduplicate: only log if last smile was >5s ago
                 last_sm = next(
                     (e for e in reversed(events) if e["type"] == "smile"), None
                 )
@@ -301,16 +286,14 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             smile_consec = 0
 
-        # ── Head pose + nod detection ─────────────────────────────────────
+        # Head pose - look away
         try:
             yaw, pitch = calc_head_pose(lm, w, h)
-
-            # Look away
             if abs(yaw) > YAW_THRESH or pitch < -PITCH_THRESH:
                 last_la = next(
                     (e for e in reversed(events) if e["type"] == "look_away"), None
                 )
-                if not last_la or t - ts_to_s(last_la["timestamp"]) > 3:
+                if not last_la or t - ts_to_s(last_la["timestamp"]) > LOOK_AWAY_DEDUP_S:
                     events.append({
                         "type":       "look_away",
                         "timestamp":  fmt_ts(t),
@@ -318,27 +301,6 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
                         "thumbnail":  frame_to_base64(frame),
                     })
                     seg_score -= PENALTY["look_away"]
-
-            # Nod detection — track pitch over time
-            pitch_history.append(pitch)
-            if len(pitch_history) > 6:
-                pitch_history.pop(0)
-
-            if len(pitch_history) >= 4:
-                # Look for up-down-up pattern in pitch
-                p = pitch_history
-                went_down = min(p[-3:]) < min(p[:3]) - NOD_PITCH_DELTA
-                came_back = max(p[-2:]) > min(p[-3:]) + NOD_PITCH_DELTA * 0.6
-                if went_down and came_back and t - last_nod_t > NOD_DEDUP_S:
-                    events.append({
-                        "type":       "nodding",
-                        "timestamp":  fmt_ts(t),
-                        "confidence": round(min(1.0, abs(min(p) - max(p)) / 20.0), 2),
-                        "thumbnail":  frame_to_base64(frame),
-                    })
-                    seg_score += BONUS["nodding"]
-                    last_nod_t = t
-
         except Exception:
             pass
 
@@ -373,29 +335,37 @@ def generate_summary(analysis: dict, filename: str) -> str:
         counts[e["type"]] = counts.get(e["type"], 0) + 1
 
     worst = min(analysis["segments"], key=lambda s: s["score"], default=None)
-    worst_str = (f"worst segment: {worst['start']}–{worst['end']} score={worst['score']}"
-                 if worst else "no segments")
+    best  = max(analysis["segments"], key=lambda s: s["score"], default=None)
+    worst_str = (f"{worst['start']}–{worst['end']} (score {worst['score']})"
+                 if worst else "N/A")
+    best_str  = (f"{best['start']}–{best['end']} (score {best['score']})"
+                 if best else "N/A")
 
-    prompt = f"""You are an educational engagement analyst reviewing webcam behavioral data.
+    prompt = f"""You are an expert educational engagement analyst. Analyze this student engagement data from a lecture webcam recording.
 
 Video: {filename}
 Duration: {analysis['total_duration']}
 Overall engagement: {analysis['engagement']} (score {analysis['engagement_score']}/100)
-Event counts: {counts}
-Note: positive signals (smile, nodding) increase the score; negative signals (yawn, eyes_closed, look_away, inactivity) decrease it.
-{worst_str}
+Behavioral events detected: {counts}
+Best segment: {best_str}
+Worst segment: {worst_str}
+Note: smiles increase the engagement score (positive signal). Yawns, closed eyes, looking away, and inactivity decrease it.
 
-Write a 3–4 sentence instructor report covering:
-1. Overall engagement assessment
-2. Balance of positive vs negative behavioral signals
-3. Which part of the session was weakest and a possible reason
-4. One concrete actionable recommendation
+Write your response in EXACTLY this format with these two sections:
 
-Direct, specific, plain prose — no bullet points."""
+ANALYSIS:
+Write 3-4 sentences analyzing the student's overall engagement, the balance of positive vs negative signals, and which part of the session was most/least engaging.
+
+RECOMMENDATIONS:
+1. [Specific actionable recommendation referencing the worst segment time if available]
+2. [Recommendation about lecture pacing, interaction, or content delivery]
+3. [Recommendation to build on positive moments or address the most frequent negative signal]
+
+Be specific, direct, and reference actual timestamps where possible. No generic advice."""
 
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=300,
+        max_tokens=400,
         messages=[{"role": "user", "content": prompt}],
     )
     return msg.content[0].text
@@ -433,9 +403,12 @@ def analyze():
             result["ai_summary"] = generate_summary(result, f.filename)
         except Exception:
             result["ai_summary"] = (
-                f"Engagement level: {result['engagement']} "
+                f"ANALYSIS:\nEngagement level: {result['engagement']} "
                 f"(score {result['engagement_score']}/100). "
-                f"{result['total_events']} behavioral events across {result['total_duration']}."
+                f"{result['total_events']} behavioral events across {result['total_duration']}.\n\n"
+                f"RECOMMENDATIONS:\n1. Review the session recording for disengagement patterns.\n"
+                f"2. Consider adding interactive elements every 10 minutes.\n"
+                f"3. Monitor student facial cues during complex topic transitions."
             )
 
         return jsonify(result)
