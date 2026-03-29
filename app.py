@@ -26,7 +26,6 @@ R_EAR_IDX = [33,  160, 158, 133, 153, 144]
 MOUTH_IDX = [61, 291, 39, 181, 0, 17, 269, 405]
 POSE_IDX  = [1, 33, 263, 61, 291, 199]
 
-# Iris landmarks
 L_IRIS_CENTER = 468
 R_IRIS_CENTER = 473
 L_EYE_INNER = 133
@@ -47,28 +46,28 @@ FACE_3D = np.array([
     [0.0,    -330.0, -65.0 ],
 ], dtype=np.float64)
 
-# Thresholds - increased for more tolerance
+# Thresholds
 EAR_THRESH          = 0.22
 MAR_THRESH          = 0.60
-YAW_THRESH          = 35.0   # increased from 28
-PITCH_THRESH        = 30.0   # increased from 22
+YAW_THRESH          = 35.0
+PITCH_THRESH        = 30.0
 INACTIVITY_GAP_S    = 5
 EYE_CONSEC_FRAMES   = 6
 YAWN_CONSEC_FRAMES  = 4
-LOOK_AWAY_DEDUP_S   = 3
+LOOK_AWAY_DEDUP_S   = 5
 SMILE_THRESH        = 0.28
 SMILE_CONSEC_FRAMES = 3
 NOD_PITCH_DELTA     = 10.0
 NOD_DEDUP_S         = 4
 CALIBRATION_N       = 10
-GAZE_H_THRESH       = 0.40   # increased from 0.25
-GAZE_V_THRESH       = 0.35   # increased from 0.25
-GAZE_CONSEC_FRAMES  = 3
+GAZE_H_THRESH       = 0.40
+GAZE_V_THRESH       = 0.35
+GAZE_CONSEC_FRAMES  = 6
 
 PENALTY = {
     "yawn":        12,
     "eyes_closed":  8,
-    "look_away":   10,
+    "look_away":    6,
     "inactivity":  15,
 }
 BONUS = {
@@ -109,19 +108,16 @@ def calc_smile_ratio(landmarks, w, h):
     mar = calc_mar(landmarks, w, h)
     if mar > MAR_THRESH * 0.8:
         return 0.0
-
     left_corner_y  = landmarks[61].y
     right_corner_y = landmarks[291].y
-    nose_y         = landmarks[1].y
     chin_y         = landmarks[152].y
+    nose_y         = landmarks[1].y
     face_h         = abs(chin_y - nose_y) + 1e-6
     avg_corner_y   = (left_corner_y + right_corner_y) / 2.0
     corner_raise   = (chin_y - avg_corner_y) / face_h
-
     smile_ratio = mouth_width / face_width
     if corner_raise > 0.6:
         smile_ratio *= 1.3
-
     return smile_ratio
 
 
@@ -322,7 +318,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             eye_consec = 0
 
-        # MAR
+        # MAR yawn
         m_ratio = calc_mar(lm, w, h)
         if m_ratio > MAR_THRESH:
             yawn_consec += 1
@@ -356,30 +352,31 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             smile_consec = 0
 
-        # Iris gaze
+        # Iris gaze — only when eyes are open
         try:
-            h_gaze, v_gaze = calc_gaze_ratio(lm, w, h)
+            if avg_ear >= EAR_THRESH:
+                h_gaze, v_gaze = calc_gaze_ratio(lm, w, h)
 
-            if baseline_h_gaze is None:
-                gaze_calib.append((h_gaze, v_gaze))
-                if len(gaze_calib) >= CALIBRATION_N:
-                    baseline_h_gaze = float(np.mean([f[0] for f in gaze_calib]))
-                    baseline_v_gaze = float(np.mean([f[1] for f in gaze_calib]))
-            else:
-                rel_h = h_gaze - baseline_h_gaze
-                rel_v = v_gaze - baseline_v_gaze
-
-                if abs(rel_h) > GAZE_H_THRESH or abs(rel_v) > GAZE_V_THRESH:
-                    gaze_consec += 1
-                    if gaze_consec == GAZE_CONSEC_FRAMES:
-                        conf = round(min(1.0, max(abs(rel_h), abs(rel_v)) / 0.4), 2)
-                        seg_score = log_look_away(events, t, conf, frame, seg_score)
+                if baseline_h_gaze is None:
+                    gaze_calib.append((h_gaze, v_gaze))
+                    if len(gaze_calib) >= CALIBRATION_N:
+                        baseline_h_gaze = float(np.mean([f[0] for f in gaze_calib]))
+                        baseline_v_gaze = float(np.mean([f[1] for f in gaze_calib]))
                 else:
-                    gaze_consec = 0
+                    rel_h = h_gaze - baseline_h_gaze
+                    rel_v = v_gaze - baseline_v_gaze
+
+                    if abs(rel_h) > GAZE_H_THRESH or abs(rel_v) > GAZE_V_THRESH:
+                        gaze_consec += 1
+                        if gaze_consec == GAZE_CONSEC_FRAMES:
+                            conf = round(min(1.0, max(abs(rel_h), abs(rel_v)) / 0.5), 2)
+                            seg_score = log_look_away(events, t, conf, frame, seg_score)
+                    else:
+                        gaze_consec = 0
         except Exception:
             pass
 
-        # Head pose
+        # Head pose — look away + nod
         try:
             yaw, pitch = calc_head_pose(lm, w, h)
 
@@ -392,10 +389,12 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
                 rel_yaw   = yaw   - baseline_yaw
                 rel_pitch = pitch - baseline_pitch
 
-                if abs(rel_yaw) > YAW_THRESH or rel_pitch < -PITCH_THRESH:
-                    conf = round(min(1.0, max(abs(rel_yaw), abs(rel_pitch)) / 45.0), 2)
+                # Large head turn = look away (only when eyes open)
+                if avg_ear >= EAR_THRESH and (abs(rel_yaw) > YAW_THRESH or rel_pitch < -PITCH_THRESH):
+                    conf = round(min(1.0, max(abs(rel_yaw), abs(rel_pitch)) / 50.0), 2)
                     seg_score = log_look_away(events, t, conf, frame, seg_score)
 
+                # Nod detection
                 if abs(rel_yaw) < 15:
                     pitch_history.append(rel_pitch)
                     if len(pitch_history) > 8:
@@ -464,7 +463,6 @@ Best segment: {best_str}
 Worst segment: {worst_str}
 
 Positive signals: smile, nodding. Negative: yawn, eyes_closed, look_away, inactivity.
-Look away uses iris gaze tracking + head pose combined.
 
 Write EXACTLY:
 
