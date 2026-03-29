@@ -1,10 +1,9 @@
 """
 engagEYE - Student Engagement Analysis Backend
 Stack: OpenCV (video I/O + preprocessing) + MediaPipe (facial landmarks + iris)
-Flask API: POST /analyze -> JSON with events, segments, score, AI summary, frame thumbnails
 
 Detectors:
-  Negative: yawn, eyes_closed, look_away (iris-based), inactivity
+  Negative: yawn, eyes_closed, look_away (iris + head pose), inactivity
   Positive: smile, nodding
 """
 
@@ -27,10 +26,7 @@ R_EAR_IDX = [33,  160, 158, 133, 153, 144]
 MOUTH_IDX = [61, 291, 39, 181, 0, 17, 269, 405]
 POSE_IDX  = [1, 33, 263, 61, 291, 199]
 
-# Iris landmarks (available with refine_landmarks=True)
-# Left iris center: 468, right iris center: 473
-# Left eye corners: 33 (inner), 133 (outer)
-# Right eye corners: 362 (inner), 263 (outer)
+# Iris landmarks
 L_IRIS_CENTER = 468
 R_IRIS_CENTER = 473
 L_EYE_INNER = 133
@@ -51,24 +47,23 @@ FACE_3D = np.array([
     [0.0,    -330.0, -65.0 ],
 ], dtype=np.float64)
 
+# Thresholds
 EAR_THRESH          = 0.22
 MAR_THRESH          = 0.60
+YAW_THRESH          = 28.0
+PITCH_THRESH        = 22.0
 INACTIVITY_GAP_S    = 5
 EYE_CONSEC_FRAMES   = 6
 YAWN_CONSEC_FRAMES  = 4
 LOOK_AWAY_DEDUP_S   = 3
-SMILE_THRESH        = 0.35
-SMILE_CONSEC_FRAMES = 4
-NOD_PITCH_DELTA     = 15.0
-NOD_DEDUP_S         = 5
+SMILE_THRESH        = 0.28   # lowered for easier detection
+SMILE_CONSEC_FRAMES = 3      # reduced for faster triggering
+NOD_PITCH_DELTA     = 10.0   # reduced for more sensitivity
+NOD_DEDUP_S         = 4
 CALIBRATION_N       = 10
-
-# Iris gaze thresholds
-# Gaze ratio: 0.5 = center, <0.35 = looking left, >0.65 = looking right
-# Vertical: <0.35 = looking up, >0.65 = looking down
-GAZE_H_THRESH       = 0.30  # horizontal deviation from center
-GAZE_V_THRESH       = 0.30  # vertical deviation from center
-GAZE_CONSEC_FRAMES  = 3     # frames gaze must be off to trigger
+GAZE_H_THRESH       = 0.25
+GAZE_V_THRESH       = 0.25
+GAZE_CONSEC_FRAMES  = 3
 
 PENALTY = {
     "yawn":        12,
@@ -105,6 +100,7 @@ def calc_mar(landmarks, w, h):
 
 
 def calc_smile_ratio(landmarks, w, h):
+    """Smile = wide mouth relative to face width, mouth not open vertically."""
     left_corner  = (landmarks[61].x * w,  landmarks[61].y * h)
     right_corner = (landmarks[291].x * w, landmarks[291].y * h)
     mouth_width  = dist(left_corner, right_corner)
@@ -114,46 +110,49 @@ def calc_smile_ratio(landmarks, w, h):
     mar = calc_mar(landmarks, w, h)
     if mar > MAR_THRESH * 0.8:
         return 0.0
-    return mouth_width / face_width
+
+    # Also check lip corners are raised (actual smile vs neutral wide mouth)
+    left_corner_y  = landmarks[61].y
+    right_corner_y = landmarks[291].y
+    nose_y         = landmarks[1].y
+    chin_y         = landmarks[152].y
+    face_h         = abs(chin_y - nose_y) + 1e-6
+    avg_corner_y   = (left_corner_y + right_corner_y) / 2.0
+    # corners raised = smaller y relative to face
+    corner_raise   = (chin_y - avg_corner_y) / face_h
+
+    smile_ratio = mouth_width / face_width
+    # Boost ratio if corners are raised
+    if corner_raise > 0.6:
+        smile_ratio *= 1.3
+
+    return smile_ratio
 
 
 def calc_gaze_ratio(landmarks, w, h):
-    """
-    Calculate horizontal and vertical gaze ratio using iris position.
-    Returns (h_ratio, v_ratio) where 0.5 = center gaze.
-    h_ratio < 0.35 = looking left, > 0.65 = looking right
-    v_ratio < 0.35 = looking up, > 0.65 = looking down
-    """
+    """Returns (h_ratio, v_ratio) where 0.5 = center gaze."""
     try:
-        # Left eye gaze
-        l_iris = (landmarks[L_IRIS_CENTER].x * w, landmarks[L_IRIS_CENTER].y * h)
-        l_inner = (landmarks[L_EYE_INNER].x * w, landmarks[L_EYE_INNER].y * h)
-        l_outer = (landmarks[L_EYE_OUTER].x * w, landmarks[L_EYE_OUTER].y * h)
-        l_top   = (landmarks[L_EYE_TOP].x * w,   landmarks[L_EYE_TOP].y * h)
-        l_bot   = (landmarks[L_EYE_BOT].x * w,   landmarks[L_EYE_BOT].y * h)
-
+        l_iris  = (landmarks[L_IRIS_CENTER].x * w, landmarks[L_IRIS_CENTER].y * h)
+        l_inner = (landmarks[L_EYE_INNER].x * w,   landmarks[L_EYE_INNER].y * h)
+        l_outer = (landmarks[L_EYE_OUTER].x * w,   landmarks[L_EYE_OUTER].y * h)
+        l_top   = (landmarks[L_EYE_TOP].x * w,     landmarks[L_EYE_TOP].y * h)
+        l_bot   = (landmarks[L_EYE_BOT].x * w,     landmarks[L_EYE_BOT].y * h)
         l_eye_w = dist(l_inner, l_outer) + 1e-6
         l_eye_h = dist(l_top,   l_bot)   + 1e-6
-        l_h_ratio = (l_iris[0] - l_outer[0]) / l_eye_w
-        l_v_ratio = (l_iris[1] - l_top[1])   / l_eye_h
+        l_h = (l_iris[0] - l_outer[0]) / l_eye_w
+        l_v = (l_iris[1] - l_top[1])   / l_eye_h
 
-        # Right eye gaze
         r_iris  = (landmarks[R_IRIS_CENTER].x * w, landmarks[R_IRIS_CENTER].y * h)
         r_inner = (landmarks[R_EYE_INNER].x * w,   landmarks[R_EYE_INNER].y * h)
         r_outer = (landmarks[R_EYE_OUTER].x * w,   landmarks[R_EYE_OUTER].y * h)
         r_top   = (landmarks[R_EYE_TOP].x * w,     landmarks[R_EYE_TOP].y * h)
         r_bot   = (landmarks[R_EYE_BOT].x * w,     landmarks[R_EYE_BOT].y * h)
-
         r_eye_w = dist(r_inner, r_outer) + 1e-6
         r_eye_h = dist(r_top,   r_bot)   + 1e-6
-        r_h_ratio = (r_iris[0] - r_outer[0]) / r_eye_w
-        r_v_ratio = (r_iris[1] - r_top[1])   / r_eye_h
+        r_h = (r_iris[0] - r_outer[0]) / r_eye_w
+        r_v = (r_iris[1] - r_top[1])   / r_eye_h
 
-        # Average both eyes
-        h_ratio = (l_h_ratio + r_h_ratio) / 2.0
-        v_ratio = (l_v_ratio + r_v_ratio) / 2.0
-
-        return h_ratio, v_ratio
+        return (l_h + r_h) / 2.0, (l_v + r_v) / 2.0
     except Exception:
         return 0.5, 0.5
 
@@ -205,6 +204,20 @@ def frame_to_base64(frame):
     return f"data:image/jpeg;base64,{b64}"
 
 
+def log_look_away(events, t, confidence, frame, seg_score):
+    """Helper to log look_away with dedup."""
+    last_la = next((e for e in reversed(events) if e["type"] == "look_away"), None)
+    if not last_la or t - ts_to_s(last_la["timestamp"]) > LOOK_AWAY_DEDUP_S:
+        events.append({
+            "type":       "look_away",
+            "timestamp":  fmt_ts(t),
+            "confidence": confidence,
+            "thumbnail":  frame_to_base64(frame),
+        })
+        return seg_score - PENALTY["look_away"]
+    return seg_score
+
+
 def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -228,15 +241,13 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
     pitch_history   = []
     last_nod_t      = -NOD_DEDUP_S - 1
 
-    # Gaze calibration
-    baseline_h_gaze     = None
-    baseline_v_gaze     = None
-    gaze_calib_frames   = []
-
-    # Head pose calibration
-    baseline_yaw        = None
-    baseline_pitch      = None
-    pose_calib_frames   = []
+    # Calibration
+    baseline_h_gaze   = None
+    baseline_v_gaze   = None
+    gaze_calib        = []
+    baseline_yaw      = None
+    baseline_pitch    = None
+    pose_calib        = []
 
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
@@ -334,7 +345,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             yawn_consec = 0
 
-        # Smile
+        # Smile detection
         smile_ratio = calc_smile_ratio(lm, w, h)
         if smile_ratio > SMILE_THRESH:
             smile_consec += 1
@@ -342,11 +353,11 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
                 last_sm = next(
                     (e for e in reversed(events) if e["type"] == "smile"), None
                 )
-                if not last_sm or t - ts_to_s(last_sm["timestamp"]) > 5:
+                if not last_sm or t - ts_to_s(last_sm["timestamp"]) > 4:
                     events.append({
                         "type":       "smile",
                         "timestamp":  fmt_ts(t),
-                        "confidence": round(min(1.0, smile_ratio / 0.5), 2),
+                        "confidence": round(min(1.0, smile_ratio / (SMILE_THRESH * 1.5)), 2),
                         "thumbnail":  frame_to_base64(frame),
                     })
                     seg_score += BONUS["smile"]
@@ -357,69 +368,58 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         try:
             h_gaze, v_gaze = calc_gaze_ratio(lm, w, h)
 
-            # Build gaze calibration baseline
             if baseline_h_gaze is None:
-                gaze_calib_frames.append((h_gaze, v_gaze))
-                if len(gaze_calib_frames) >= CALIBRATION_N:
-                    baseline_h_gaze = float(np.mean([f[0] for f in gaze_calib_frames]))
-                    baseline_v_gaze = float(np.mean([f[1] for f in gaze_calib_frames]))
+                gaze_calib.append((h_gaze, v_gaze))
+                if len(gaze_calib) >= CALIBRATION_N:
+                    baseline_h_gaze = float(np.mean([f[0] for f in gaze_calib]))
+                    baseline_v_gaze = float(np.mean([f[1] for f in gaze_calib]))
             else:
-                # Relative gaze deviation from calibrated neutral
                 rel_h = h_gaze - baseline_h_gaze
                 rel_v = v_gaze - baseline_v_gaze
 
-                looking_away = abs(rel_h) > GAZE_H_THRESH or abs(rel_v) > GAZE_V_THRESH
-
-                if looking_away:
+                if abs(rel_h) > GAZE_H_THRESH or abs(rel_v) > GAZE_V_THRESH:
                     gaze_consec += 1
                     if gaze_consec == GAZE_CONSEC_FRAMES:
-                        last_la = next(
-                            (e for e in reversed(events) if e["type"] == "look_away"), None
-                        )
-                        if not last_la or t - ts_to_s(last_la["timestamp"]) > LOOK_AWAY_DEDUP_S:
-                            conf = round(min(1.0, max(abs(rel_h), abs(rel_v)) / 0.4), 2)
-                            events.append({
-                                "type":       "look_away",
-                                "timestamp":  fmt_ts(t),
-                                "confidence": conf,
-                                "thumbnail":  frame_to_base64(frame),
-                            })
-                            seg_score -= PENALTY["look_away"]
+                        conf = round(min(1.0, max(abs(rel_h), abs(rel_v)) / 0.4), 2)
+                        seg_score = log_look_away(events, t, conf, frame, seg_score)
                 else:
                     gaze_consec = 0
-
         except Exception:
             pass
 
-        # Head pose for nod detection only
+        # Head pose - for look_away (large turns) AND nod detection
         try:
             yaw, pitch = calc_head_pose(lm, w, h)
 
-            # Build pose calibration
             if baseline_yaw is None:
-                pose_calib_frames.append((yaw, pitch))
-                if len(pose_calib_frames) >= CALIBRATION_N:
-                    baseline_yaw   = float(np.mean([f[0] for f in pose_calib_frames]))
-                    baseline_pitch = float(np.mean([f[1] for f in pose_calib_frames]))
+                pose_calib.append((yaw, pitch))
+                if len(pose_calib) >= CALIBRATION_N:
+                    baseline_yaw   = float(np.mean([f[0] for f in pose_calib]))
+                    baseline_pitch = float(np.mean([f[1] for f in pose_calib]))
             else:
                 rel_yaw   = yaw   - baseline_yaw
                 rel_pitch = pitch - baseline_pitch
 
-                # Nod detection only
+                # Large head turn = look away
+                if abs(rel_yaw) > YAW_THRESH or rel_pitch < -PITCH_THRESH:
+                    conf = round(min(1.0, max(abs(rel_yaw), abs(rel_pitch)) / 45.0), 2)
+                    seg_score = log_look_away(events, t, conf, frame, seg_score)
+
+                # Nod detection
                 if abs(rel_yaw) < 15:
                     pitch_history.append(rel_pitch)
                     if len(pitch_history) > 8:
                         pitch_history.pop(0)
 
-                    if len(pitch_history) >= 6:
+                    if len(pitch_history) >= 5:
                         p = pitch_history
                         went_down = min(p[-3:]) < min(p[:3]) - NOD_PITCH_DELTA
-                        came_back = max(p[-2:]) > min(p[-3:]) + NOD_PITCH_DELTA * 0.6
+                        came_back = max(p[-2:]) > min(p[-3:]) + NOD_PITCH_DELTA * 0.5
                         if went_down and came_back and t - last_nod_t > NOD_DEDUP_S:
                             events.append({
                                 "type":       "nodding",
                                 "timestamp":  fmt_ts(t),
-                                "confidence": round(min(1.0, abs(min(p) - max(p)) / 20.0), 2),
+                                "confidence": round(min(1.0, abs(min(p) - max(p)) / 15.0), 2),
                                 "thumbnail":  frame_to_base64(frame),
                             })
                             seg_score += BONUS["nodding"]
@@ -462,33 +462,30 @@ def generate_summary(analysis: dict, filename: str) -> str:
 
     worst = min(analysis["segments"], key=lambda s: s["score"], default=None)
     best  = max(analysis["segments"], key=lambda s: s["score"], default=None)
-    worst_str = (f"{worst['start']}–{worst['end']} (score {worst['score']})"
-                 if worst else "N/A")
-    best_str  = (f"{best['start']}–{best['end']} (score {best['score']})"
-                 if best else "N/A")
+    worst_str = (f"{worst['start']}–{worst['end']} (score {worst['score']})" if worst else "N/A")
+    best_str  = (f"{best['start']}–{best['end']} (score {best['score']})"  if best  else "N/A")
 
-    prompt = f"""You are an expert educational engagement analyst. Analyze this student engagement data from a lecture webcam recording.
+    prompt = f"""You are an expert educational engagement analyst. Analyze this student engagement data.
 
 Video: {filename}
 Duration: {analysis['total_duration']}
 Overall engagement: {analysis['engagement']} (score {analysis['engagement_score']}/100)
-Behavioral events detected: {counts}
+Events: {counts}
 Best segment: {best_str}
 Worst segment: {worst_str}
-Note: smiles and nodding increase the engagement score (positive signals). Yawns, closed eyes, looking away, and inactivity decrease it.
-Look away is detected using iris gaze tracking — when the student's eyes move significantly from their calibrated neutral gaze direction.
 
-Write your response in EXACTLY this format:
+Positive signals: smile, nodding. Negative: yawn, eyes_closed, look_away, inactivity.
+Look away uses iris gaze tracking + head pose combined.
+
+Write EXACTLY:
 
 ANALYSIS:
-Write 3-4 sentences analyzing the student's overall engagement, the balance of positive vs negative signals, and which part of the session was most/least engaging.
+3-4 sentences on overall engagement, positive vs negative signals, best/worst moments.
 
 RECOMMENDATIONS:
-1. [Specific actionable recommendation referencing the worst segment time if available]
-2. [Recommendation about lecture pacing, interaction, or content delivery]
-3. [Recommendation to build on positive moments or address the most frequent negative signal]
-
-Be specific, direct, and reference actual timestamps where possible. No generic advice."""
+1. [Specific recommendation with timestamp]
+2. [Pacing or content delivery recommendation]
+3. [Build on positives or fix most frequent negative]"""
 
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
