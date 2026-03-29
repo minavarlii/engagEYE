@@ -47,22 +47,22 @@ FACE_3D = np.array([
     [0.0,    -330.0, -65.0 ],
 ], dtype=np.float64)
 
-# Thresholds
+# Thresholds - increased for more tolerance
 EAR_THRESH          = 0.22
 MAR_THRESH          = 0.60
-YAW_THRESH          = 28.0
-PITCH_THRESH        = 22.0
+YAW_THRESH          = 35.0   # increased from 28
+PITCH_THRESH        = 30.0   # increased from 22
 INACTIVITY_GAP_S    = 5
 EYE_CONSEC_FRAMES   = 6
 YAWN_CONSEC_FRAMES  = 4
 LOOK_AWAY_DEDUP_S   = 3
-SMILE_THRESH        = 0.28   # lowered for easier detection
-SMILE_CONSEC_FRAMES = 3      # reduced for faster triggering
-NOD_PITCH_DELTA     = 10.0   # reduced for more sensitivity
+SMILE_THRESH        = 0.28
+SMILE_CONSEC_FRAMES = 3
+NOD_PITCH_DELTA     = 10.0
 NOD_DEDUP_S         = 4
 CALIBRATION_N       = 10
-GAZE_H_THRESH       = 0.25
-GAZE_V_THRESH       = 0.25
+GAZE_H_THRESH       = 0.40   # increased from 0.25
+GAZE_V_THRESH       = 0.35   # increased from 0.25
 GAZE_CONSEC_FRAMES  = 3
 
 PENALTY = {
@@ -100,7 +100,6 @@ def calc_mar(landmarks, w, h):
 
 
 def calc_smile_ratio(landmarks, w, h):
-    """Smile = wide mouth relative to face width, mouth not open vertically."""
     left_corner  = (landmarks[61].x * w,  landmarks[61].y * h)
     right_corner = (landmarks[291].x * w, landmarks[291].y * h)
     mouth_width  = dist(left_corner, right_corner)
@@ -111,18 +110,15 @@ def calc_smile_ratio(landmarks, w, h):
     if mar > MAR_THRESH * 0.8:
         return 0.0
 
-    # Also check lip corners are raised (actual smile vs neutral wide mouth)
     left_corner_y  = landmarks[61].y
     right_corner_y = landmarks[291].y
     nose_y         = landmarks[1].y
     chin_y         = landmarks[152].y
     face_h         = abs(chin_y - nose_y) + 1e-6
     avg_corner_y   = (left_corner_y + right_corner_y) / 2.0
-    # corners raised = smaller y relative to face
     corner_raise   = (chin_y - avg_corner_y) / face_h
 
     smile_ratio = mouth_width / face_width
-    # Boost ratio if corners are raised
     if corner_raise > 0.6:
         smile_ratio *= 1.3
 
@@ -130,7 +126,6 @@ def calc_smile_ratio(landmarks, w, h):
 
 
 def calc_gaze_ratio(landmarks, w, h):
-    """Returns (h_ratio, v_ratio) where 0.5 = center gaze."""
     try:
         l_iris  = (landmarks[L_IRIS_CENTER].x * w, landmarks[L_IRIS_CENTER].y * h)
         l_inner = (landmarks[L_EYE_INNER].x * w,   landmarks[L_EYE_INNER].y * h)
@@ -205,7 +200,6 @@ def frame_to_base64(frame):
 
 
 def log_look_away(events, t, confidence, frame, seg_score):
-    """Helper to log look_away with dedup."""
     last_la = next((e for e in reversed(events) if e["type"] == "look_away"), None)
     if not last_la or t - ts_to_s(last_la["timestamp"]) > LOOK_AWAY_DEDUP_S:
         events.append({
@@ -241,7 +235,6 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
     pitch_history   = []
     last_nod_t      = -NOD_DEDUP_S - 1
 
-    # Calibration
     baseline_h_gaze   = None
     baseline_v_gaze   = None
     gaze_calib        = []
@@ -278,7 +271,6 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
             seg_start = t
             seg_score = 100
 
-        # OpenCV preprocessing
         h_orig, w_orig = frame.shape[:2]
         scale = 640 / max(w_orig, h_orig)
         if scale < 1.0:
@@ -315,7 +307,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         last_face_frm = frame_idx
         lm = result.multi_face_landmarks[0].landmark
 
-        # EAR - eye closure
+        # EAR
         avg_ear = (calc_ear(lm, L_EAR_IDX, w, h) + calc_ear(lm, R_EAR_IDX, w, h)) / 2.0
         if avg_ear < EAR_THRESH:
             eye_consec += 1
@@ -330,7 +322,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             eye_consec = 0
 
-        # MAR - yawn
+        # MAR
         m_ratio = calc_mar(lm, w, h)
         if m_ratio > MAR_THRESH:
             yawn_consec += 1
@@ -345,7 +337,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             yawn_consec = 0
 
-        # Smile detection
+        # Smile
         smile_ratio = calc_smile_ratio(lm, w, h)
         if smile_ratio > SMILE_THRESH:
             smile_consec += 1
@@ -364,7 +356,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             smile_consec = 0
 
-        # Iris gaze detection
+        # Iris gaze
         try:
             h_gaze, v_gaze = calc_gaze_ratio(lm, w, h)
 
@@ -387,7 +379,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         except Exception:
             pass
 
-        # Head pose - for look_away (large turns) AND nod detection
+        # Head pose
         try:
             yaw, pitch = calc_head_pose(lm, w, h)
 
@@ -400,12 +392,10 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
                 rel_yaw   = yaw   - baseline_yaw
                 rel_pitch = pitch - baseline_pitch
 
-                # Large head turn = look away
                 if abs(rel_yaw) > YAW_THRESH or rel_pitch < -PITCH_THRESH:
                     conf = round(min(1.0, max(abs(rel_yaw), abs(rel_pitch)) / 45.0), 2)
                     seg_score = log_look_away(events, t, conf, frame, seg_score)
 
-                # Nod detection
                 if abs(rel_yaw) < 15:
                     pitch_history.append(rel_pitch)
                     if len(pitch_history) > 8:
@@ -430,7 +420,6 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         except Exception:
             pass
 
-    # Flush final segment
     if seg_start < total_secs:
         segments.append({
             "start":      fmt_ts(seg_start),
