@@ -1,16 +1,11 @@
 """
 engagEYE - Student Engagement Analysis Backend
-Stack: OpenCV (video I/O + preprocessing) + MediaPipe (facial landmarks)
+Stack: OpenCV (video I/O + preprocessing) + MediaPipe (facial landmarks + iris)
 Flask API: POST /analyze -> JSON with events, segments, score, AI summary, frame thumbnails
 
 Detectors:
-  Negative: yawn, eyes_closed, look_away, inactivity
+  Negative: yawn, eyes_closed, look_away (iris-based), inactivity
   Positive: smile, nodding
-
-Features:
-  - Per-session calibration for head pose (first 10 frames = neutral baseline)
-  - Auto gamma correction for low-light webcams
-  - Frame thumbnails for each detected event
 """
 
 import cv2
@@ -32,6 +27,21 @@ R_EAR_IDX = [33,  160, 158, 133, 153, 144]
 MOUTH_IDX = [61, 291, 39, 181, 0, 17, 269, 405]
 POSE_IDX  = [1, 33, 263, 61, 291, 199]
 
+# Iris landmarks (available with refine_landmarks=True)
+# Left iris center: 468, right iris center: 473
+# Left eye corners: 33 (inner), 133 (outer)
+# Right eye corners: 362 (inner), 263 (outer)
+L_IRIS_CENTER = 468
+R_IRIS_CENTER = 473
+L_EYE_INNER = 133
+L_EYE_OUTER = 33
+R_EYE_INNER = 362
+R_EYE_OUTER = 263
+L_EYE_TOP = 159
+L_EYE_BOT = 145
+R_EYE_TOP = 386
+R_EYE_BOT = 374
+
 FACE_3D = np.array([
     [0.0,    0.0,    0.0   ],
     [-225.0, -170.0, -135.0],
@@ -43,8 +53,6 @@ FACE_3D = np.array([
 
 EAR_THRESH          = 0.22
 MAR_THRESH          = 0.60
-YAW_THRESH          = 25.0
-PITCH_THRESH        = 20.0
 INACTIVITY_GAP_S    = 5
 EYE_CONSEC_FRAMES   = 6
 YAWN_CONSEC_FRAMES  = 4
@@ -54,6 +62,13 @@ SMILE_CONSEC_FRAMES = 4
 NOD_PITCH_DELTA     = 15.0
 NOD_DEDUP_S         = 5
 CALIBRATION_N       = 10
+
+# Iris gaze thresholds
+# Gaze ratio: 0.5 = center, <0.35 = looking left, >0.65 = looking right
+# Vertical: <0.35 = looking up, >0.65 = looking down
+GAZE_H_THRESH       = 0.30  # horizontal deviation from center
+GAZE_V_THRESH       = 0.30  # vertical deviation from center
+GAZE_CONSEC_FRAMES  = 3     # frames gaze must be off to trigger
 
 PENALTY = {
     "yawn":        12,
@@ -100,6 +115,47 @@ def calc_smile_ratio(landmarks, w, h):
     if mar > MAR_THRESH * 0.8:
         return 0.0
     return mouth_width / face_width
+
+
+def calc_gaze_ratio(landmarks, w, h):
+    """
+    Calculate horizontal and vertical gaze ratio using iris position.
+    Returns (h_ratio, v_ratio) where 0.5 = center gaze.
+    h_ratio < 0.35 = looking left, > 0.65 = looking right
+    v_ratio < 0.35 = looking up, > 0.65 = looking down
+    """
+    try:
+        # Left eye gaze
+        l_iris = (landmarks[L_IRIS_CENTER].x * w, landmarks[L_IRIS_CENTER].y * h)
+        l_inner = (landmarks[L_EYE_INNER].x * w, landmarks[L_EYE_INNER].y * h)
+        l_outer = (landmarks[L_EYE_OUTER].x * w, landmarks[L_EYE_OUTER].y * h)
+        l_top   = (landmarks[L_EYE_TOP].x * w,   landmarks[L_EYE_TOP].y * h)
+        l_bot   = (landmarks[L_EYE_BOT].x * w,   landmarks[L_EYE_BOT].y * h)
+
+        l_eye_w = dist(l_inner, l_outer) + 1e-6
+        l_eye_h = dist(l_top,   l_bot)   + 1e-6
+        l_h_ratio = (l_iris[0] - l_outer[0]) / l_eye_w
+        l_v_ratio = (l_iris[1] - l_top[1])   / l_eye_h
+
+        # Right eye gaze
+        r_iris  = (landmarks[R_IRIS_CENTER].x * w, landmarks[R_IRIS_CENTER].y * h)
+        r_inner = (landmarks[R_EYE_INNER].x * w,   landmarks[R_EYE_INNER].y * h)
+        r_outer = (landmarks[R_EYE_OUTER].x * w,   landmarks[R_EYE_OUTER].y * h)
+        r_top   = (landmarks[R_EYE_TOP].x * w,     landmarks[R_EYE_TOP].y * h)
+        r_bot   = (landmarks[R_EYE_BOT].x * w,     landmarks[R_EYE_BOT].y * h)
+
+        r_eye_w = dist(r_inner, r_outer) + 1e-6
+        r_eye_h = dist(r_top,   r_bot)   + 1e-6
+        r_h_ratio = (r_iris[0] - r_outer[0]) / r_eye_w
+        r_v_ratio = (r_iris[1] - r_top[1])   / r_eye_h
+
+        # Average both eyes
+        h_ratio = (l_h_ratio + r_h_ratio) / 2.0
+        v_ratio = (l_v_ratio + r_v_ratio) / 2.0
+
+        return h_ratio, v_ratio
+    except Exception:
+        return 0.5, 0.5
 
 
 def calc_head_pose(landmarks, w, h):
@@ -164,6 +220,7 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
     eye_consec      = 0
     yawn_consec     = 0
     smile_consec    = 0
+    gaze_consec     = 0
     last_face_frm   = 0
     last_inact_frm  = -(INACTIVITY_GAP_S * fps + 1)
     seg_start       = 0.0
@@ -171,10 +228,15 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
     pitch_history   = []
     last_nod_t      = -NOD_DEDUP_S - 1
 
-    # Calibration state
+    # Gaze calibration
+    baseline_h_gaze     = None
+    baseline_v_gaze     = None
+    gaze_calib_frames   = []
+
+    # Head pose calibration
     baseline_yaw        = None
     baseline_pitch      = None
-    calibration_frames  = []
+    pose_calib_frames   = []
 
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
@@ -291,57 +353,79 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             smile_consec = 0
 
-        # Head pose with calibration
+        # Iris gaze detection
+        try:
+            h_gaze, v_gaze = calc_gaze_ratio(lm, w, h)
+
+            # Build gaze calibration baseline
+            if baseline_h_gaze is None:
+                gaze_calib_frames.append((h_gaze, v_gaze))
+                if len(gaze_calib_frames) >= CALIBRATION_N:
+                    baseline_h_gaze = float(np.mean([f[0] for f in gaze_calib_frames]))
+                    baseline_v_gaze = float(np.mean([f[1] for f in gaze_calib_frames]))
+            else:
+                # Relative gaze deviation from calibrated neutral
+                rel_h = h_gaze - baseline_h_gaze
+                rel_v = v_gaze - baseline_v_gaze
+
+                looking_away = abs(rel_h) > GAZE_H_THRESH or abs(rel_v) > GAZE_V_THRESH
+
+                if looking_away:
+                    gaze_consec += 1
+                    if gaze_consec == GAZE_CONSEC_FRAMES:
+                        last_la = next(
+                            (e for e in reversed(events) if e["type"] == "look_away"), None
+                        )
+                        if not last_la or t - ts_to_s(last_la["timestamp"]) > LOOK_AWAY_DEDUP_S:
+                            conf = round(min(1.0, max(abs(rel_h), abs(rel_v)) / 0.4), 2)
+                            events.append({
+                                "type":       "look_away",
+                                "timestamp":  fmt_ts(t),
+                                "confidence": conf,
+                                "thumbnail":  frame_to_base64(frame),
+                            })
+                            seg_score -= PENALTY["look_away"]
+                else:
+                    gaze_consec = 0
+
+        except Exception:
+            pass
+
+        # Head pose for nod detection only
         try:
             yaw, pitch = calc_head_pose(lm, w, h)
 
-            # Build calibration baseline from first N frames
+            # Build pose calibration
             if baseline_yaw is None:
-                calibration_frames.append((yaw, pitch))
-                if len(calibration_frames) >= CALIBRATION_N:
-                    baseline_yaw   = float(np.mean([f[0] for f in calibration_frames]))
-                    baseline_pitch = float(np.mean([f[1] for f in calibration_frames]))
-                continue  # skip detection until calibrated
-
-            # Use relative angles from neutral baseline
-            rel_yaw   = yaw   - baseline_yaw
-            rel_pitch = pitch - baseline_pitch
-
-            # Look away detection
-            if abs(rel_yaw) > YAW_THRESH or rel_pitch < -PITCH_THRESH:
-                last_la = next(
-                    (e for e in reversed(events) if e["type"] == "look_away"), None
-                )
-                if not last_la or t - ts_to_s(last_la["timestamp"]) > LOOK_AWAY_DEDUP_S:
-                    events.append({
-                        "type":       "look_away",
-                        "timestamp":  fmt_ts(t),
-                        "confidence": round(min(1.0, max(abs(rel_yaw), abs(rel_pitch)) / 45.0), 2),
-                        "thumbnail":  frame_to_base64(frame),
-                    })
-                    seg_score -= PENALTY["look_away"]
-
-            # Nod detection - only when face is forward relative to baseline
-            if abs(rel_yaw) < 15:
-                pitch_history.append(rel_pitch)
-                if len(pitch_history) > 8:
-                    pitch_history.pop(0)
-
-                if len(pitch_history) >= 6:
-                    p = pitch_history
-                    went_down = min(p[-3:]) < min(p[:3]) - NOD_PITCH_DELTA
-                    came_back = max(p[-2:]) > min(p[-3:]) + NOD_PITCH_DELTA * 0.6
-                    if went_down and came_back and t - last_nod_t > NOD_DEDUP_S:
-                        events.append({
-                            "type":       "nodding",
-                            "timestamp":  fmt_ts(t),
-                            "confidence": round(min(1.0, abs(min(p) - max(p)) / 20.0), 2),
-                            "thumbnail":  frame_to_base64(frame),
-                        })
-                        seg_score += BONUS["nodding"]
-                        last_nod_t = t
+                pose_calib_frames.append((yaw, pitch))
+                if len(pose_calib_frames) >= CALIBRATION_N:
+                    baseline_yaw   = float(np.mean([f[0] for f in pose_calib_frames]))
+                    baseline_pitch = float(np.mean([f[1] for f in pose_calib_frames]))
             else:
-                pitch_history = []
+                rel_yaw   = yaw   - baseline_yaw
+                rel_pitch = pitch - baseline_pitch
+
+                # Nod detection only
+                if abs(rel_yaw) < 15:
+                    pitch_history.append(rel_pitch)
+                    if len(pitch_history) > 8:
+                        pitch_history.pop(0)
+
+                    if len(pitch_history) >= 6:
+                        p = pitch_history
+                        went_down = min(p[-3:]) < min(p[:3]) - NOD_PITCH_DELTA
+                        came_back = max(p[-2:]) > min(p[-3:]) + NOD_PITCH_DELTA * 0.6
+                        if went_down and came_back and t - last_nod_t > NOD_DEDUP_S:
+                            events.append({
+                                "type":       "nodding",
+                                "timestamp":  fmt_ts(t),
+                                "confidence": round(min(1.0, abs(min(p) - max(p)) / 20.0), 2),
+                                "thumbnail":  frame_to_base64(frame),
+                            })
+                            seg_score += BONUS["nodding"]
+                            last_nod_t = t
+                else:
+                    pitch_history = []
 
         except Exception:
             pass
@@ -392,6 +476,7 @@ Behavioral events detected: {counts}
 Best segment: {best_str}
 Worst segment: {worst_str}
 Note: smiles and nodding increase the engagement score (positive signals). Yawns, closed eyes, looking away, and inactivity decrease it.
+Look away is detected using iris gaze tracking — when the student's eyes move significantly from their calibrated neutral gaze direction.
 
 Write your response in EXACTLY this format:
 
@@ -416,39 +501,6 @@ Be specific, direct, and reference actual timestamps where possible. No generic 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "engagEYE"})
-
-
-@app.route("/chat", methods=["POST"])
-def chat():
-    data = request.get_json()
-    if not data or "message" not in data:
-        return jsonify({"error": "Send JSON with 'message' field"}), 400
-
-    user_message = data["message"]
-    analysis     = data.get("analysis", {})
-
-    client = anthropic.Anthropic()
-
-    context = f"""You are an AI assistant for engagEYE, a student engagement analysis platform.
-You have access to the following analysis results:
-
-Overall engagement: {analysis.get('engagement', 'N/A')} (score {analysis.get('engagement_score', 'N/A')}/100)
-Duration: {analysis.get('total_duration', 'N/A')}
-Total events: {analysis.get('total_events', 'N/A')}
-Events: {[e['type'] + ' at ' + e['timestamp'] for e in analysis.get('events', [])]}
-Segments: {analysis.get('segments', [])}
-
-Answer the user's question about this engagement analysis. Be specific, helpful, and reference the actual data.
-Keep answers concise (2-3 sentences max)."""
-
-    msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=200,
-        system=context,
-        messages=[{"role": "user", "content": user_message}],
-    )
-
-    return jsonify({"response": msg.content[0].text})
 
 
 @app.route("/analyze", methods=["POST"])
