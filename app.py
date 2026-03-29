@@ -6,6 +6,11 @@ Flask API: POST /analyze -> JSON with events, segments, score, AI summary, frame
 Detectors:
   Negative: yawn, eyes_closed, look_away, inactivity
   Positive: smile, nodding
+
+Features:
+  - Per-session calibration for head pose (first 10 frames = neutral baseline)
+  - Auto gamma correction for low-light webcams
+  - Frame thumbnails for each detected event
 """
 
 import cv2
@@ -48,6 +53,7 @@ SMILE_THRESH        = 0.35
 SMILE_CONSEC_FRAMES = 4
 NOD_PITCH_DELTA     = 15.0
 NOD_DEDUP_S         = 5
+CALIBRATION_N       = 10
 
 PENALTY = {
     "yawn":        12,
@@ -155,15 +161,20 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
 
     events, segments = [], []
 
-    eye_consec     = 0
-    yawn_consec    = 0
-    smile_consec   = 0
-    last_face_frm  = 0
-    last_inact_frm = -(INACTIVITY_GAP_S * fps + 1)
-    seg_start      = 0.0
-    seg_score      = 100
-    pitch_history  = []
-    last_nod_t     = -NOD_DEDUP_S - 1
+    eye_consec      = 0
+    yawn_consec     = 0
+    smile_consec    = 0
+    last_face_frm   = 0
+    last_inact_frm  = -(INACTIVITY_GAP_S * fps + 1)
+    seg_start       = 0.0
+    seg_score       = 100
+    pitch_history   = []
+    last_nod_t      = -NOD_DEDUP_S - 1
+
+    # Calibration state
+    baseline_yaw        = None
+    baseline_pitch      = None
+    calibration_frames  = []
 
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
@@ -280,12 +291,24 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
         else:
             smile_consec = 0
 
-        # Head pose + nod detection
+        # Head pose with calibration
         try:
             yaw, pitch = calc_head_pose(lm, w, h)
 
-            # Look away
-            if abs(yaw) > YAW_THRESH or pitch < -PITCH_THRESH:
+            # Build calibration baseline from first N frames
+            if baseline_yaw is None:
+                calibration_frames.append((yaw, pitch))
+                if len(calibration_frames) >= CALIBRATION_N:
+                    baseline_yaw   = float(np.mean([f[0] for f in calibration_frames]))
+                    baseline_pitch = float(np.mean([f[1] for f in calibration_frames]))
+                continue  # skip detection until calibrated
+
+            # Use relative angles from neutral baseline
+            rel_yaw   = yaw   - baseline_yaw
+            rel_pitch = pitch - baseline_pitch
+
+            # Look away detection
+            if abs(rel_yaw) > YAW_THRESH or rel_pitch < -PITCH_THRESH:
                 last_la = next(
                     (e for e in reversed(events) if e["type"] == "look_away"), None
                 )
@@ -293,14 +316,14 @@ def analyze_video(video_path: str, segment_secs: int = 30) -> dict:
                     events.append({
                         "type":       "look_away",
                         "timestamp":  fmt_ts(t),
-                        "confidence": round(min(1.0, max(abs(yaw), abs(pitch)) / 45.0), 2),
+                        "confidence": round(min(1.0, max(abs(rel_yaw), abs(rel_pitch)) / 45.0), 2),
                         "thumbnail":  frame_to_base64(frame),
                     })
                     seg_score -= PENALTY["look_away"]
 
-            # Nod detection - only when face is forward
-            if abs(yaw) < 15:
-                pitch_history.append(pitch)
+            # Nod detection - only when face is forward relative to baseline
+            if abs(rel_yaw) < 15:
+                pitch_history.append(rel_pitch)
                 if len(pitch_history) > 8:
                     pitch_history.pop(0)
 
@@ -393,6 +416,39 @@ Be specific, direct, and reference actual timestamps where possible. No generic 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "engagEYE"})
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.get_json()
+    if not data or "message" not in data:
+        return jsonify({"error": "Send JSON with 'message' field"}), 400
+
+    user_message = data["message"]
+    analysis     = data.get("analysis", {})
+
+    client = anthropic.Anthropic()
+
+    context = f"""You are an AI assistant for engagEYE, a student engagement analysis platform.
+You have access to the following analysis results:
+
+Overall engagement: {analysis.get('engagement', 'N/A')} (score {analysis.get('engagement_score', 'N/A')}/100)
+Duration: {analysis.get('total_duration', 'N/A')}
+Total events: {analysis.get('total_events', 'N/A')}
+Events: {[e['type'] + ' at ' + e['timestamp'] for e in analysis.get('events', [])]}
+Segments: {analysis.get('segments', [])}
+
+Answer the user's question about this engagement analysis. Be specific, helpful, and reference the actual data.
+Keep answers concise (2-3 sentences max)."""
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=200,
+        system=context,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    return jsonify({"response": msg.content[0].text})
 
 
 @app.route("/analyze", methods=["POST"])
